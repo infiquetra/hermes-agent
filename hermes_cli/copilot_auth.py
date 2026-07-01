@@ -45,10 +45,17 @@ _SUPPORTED_PREFIXES = ("gho_", "github_pat_", "ghu_")
 
 # Env var search order (matches Copilot CLI)
 COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+COPILOT_DISABLE_ENV_VAR = "HERMES_DISABLE_COPILOT"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # Polling constants
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
+
+
+def copilot_disabled() -> bool:
+    """Return whether Copilot auth should be bypassed for this process."""
+    return os.getenv(COPILOT_DISABLE_ENV_VAR, "").strip().lower() in _TRUTHY_ENV_VALUES
 
 
 def validate_copilot_token(token: str) -> tuple[bool, str]:
@@ -78,6 +85,9 @@ def resolve_copilot_token() -> tuple[str, str]:
     Returns (token, source) where source describes where the token came from.
     Raises ValueError if only a classic PAT is available.
     """
+    if copilot_disabled():
+        return "", COPILOT_DISABLE_ENV_VAR
+
     # 1. Check env vars in priority order
     for env_var in COPILOT_ENV_VARS:
         val = os.getenv(env_var, "").strip()
@@ -424,6 +434,9 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
     exchange (``endpoints.api``, with a ``proxy-ep`` fallback), or None for
     individual accounts.
     """
+    if copilot_disabled():
+        return ""
+
     if not raw_token:
         return raw_token, None
     try:

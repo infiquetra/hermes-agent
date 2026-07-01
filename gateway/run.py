@@ -12352,6 +12352,129 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
+    def _should_send_interim_voice_reply(
+        self,
+        event: MessageEvent,
+        text: str,
+        *,
+        enabled: bool = False,
+    ) -> bool:
+        """Return True when an interim assistant message may be spoken.
+
+        Interim assistant messages are mid-turn commentary, not the final
+        answer.  Keep them silent unless the explicit display config opts in,
+        and only play them into a live Discord voice channel — never as a chat
+        audio attachment.
+        """
+        if not enabled:
+            return False
+        if event.source.platform != Platform.DISCORD:
+            return False
+
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return False
+        if len(cleaned) > 400:
+            return False
+
+        lowered = cleaned.lower()
+        if (
+            "```" in cleaned
+            or "media:" in lowered
+            or "[[audio_as_voice]]" in lowered
+            or "traceback" in lowered
+            or cleaned.startswith("Error:")
+        ):
+            return False
+
+        voice_mode = self._voice_mode.get(
+            self._voice_key(event.source.platform, event.source.chat_id),
+            "off",
+        )
+        is_voice_input = event.message_type == MessageType.VOICE
+        if voice_mode == "voice_only" and not is_voice_input:
+            return False
+        if voice_mode not in {"all", "voice_only"}:
+            return False
+
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return False
+
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return False
+        is_connected = getattr(adapter, "is_in_voice_channel", None)
+        play_in_voice = getattr(adapter, "play_in_voice_channel", None)
+        if not callable(is_connected) or not callable(play_in_voice):
+            return False
+        try:
+            return bool(is_connected(guild_id))
+        except Exception:
+            return False
+
+    async def _send_interim_voice_reply(self, event: MessageEvent, text: str) -> bool:
+        """Speak an interim assistant message into the Discord voice channel."""
+        import uuid as _uuid
+
+        if not self._should_send_interim_voice_reply(event, text, enabled=True):
+            return False
+
+        audio_path = None
+        actual_path = None
+        try:
+            from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+
+            tts_text = _strip_markdown_for_tts(str(text or "")[:400]).strip()
+            if not tts_text:
+                return False
+
+            audio_path = os.path.join(
+                tempfile.gettempdir(),
+                "hermes_voice",
+                f"tts_interim_{_uuid.uuid4().hex[:12]}.mp3",
+            )
+            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+
+            result_json = await asyncio.to_thread(
+                text_to_speech_tool,
+                text=tts_text,
+                output_path=audio_path,
+            )
+            try:
+                result = json.loads(result_json)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Interim voice reply TTS returned invalid JSON: %s",
+                    result_json[:200] if result_json else result_json,
+                )
+                return False
+
+            actual_path = result.get("file_path", audio_path)
+            if not result.get("success") or not os.path.isfile(actual_path):
+                logger.warning("Interim voice reply TTS failed: %s", result.get("error"))
+                return False
+
+            guild_id = self._get_guild_id(event)
+            adapter = self.adapters.get(Platform.DISCORD)
+            play_in_voice = getattr(adapter, "play_in_voice_channel", None)
+            if not guild_id or not adapter or not callable(play_in_voice):
+                return False
+
+            playback_result = play_in_voice(guild_id, actual_path)
+            if inspect.isawaitable(playback_result):
+                playback_result = await playback_result
+            return bool(playback_result)
+        except Exception as e:
+            logger.warning("Interim voice reply failed: %s", e, exc_info=True)
+            return False
+        finally:
+            for p in {audio_path, actual_path} - {None}:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
@@ -15999,6 +16122,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 require_platform_override_for={Platform.MATTERMOST},
             )
         )
+        # Speaking interim assistant messages is deliberately narrower than
+        # showing them in chat.  It only applies to Discord voice-channel mode
+        # and defaults off to avoid reading every mid-turn status line aloud.
+        speak_interim_assistant_messages_enabled = (
+            source.platform == Platform.DISCORD
+            and _resolve_gateway_display_bool(
+                user_config,
+                platform_key,
+                "speak_interim_assistant_messages",
+                default=False,
+                platform=source.platform,
+            )
+        )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
         # Mattermost requires a per-platform opt-in: global scratch-text display
@@ -16902,13 +17038,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
+                interim_text = str(text or "").strip()
+                if (
+                    interim_text
+                    and not already_streamed
+                    and self._should_send_interim_voice_reply(
+                        event,
+                        interim_text,
+                        enabled=speak_interim_assistant_messages_enabled,
+                    )
+                ):
+                    safe_schedule_threadsafe(
+                        self._send_interim_voice_reply(event, interim_text),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="interim_voice_reply scheduling error",
+                    )
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
                     else:
                         _stream_consumer.on_commentary(text)
                     return
-                if already_streamed or not _status_adapter or not str(text or "").strip():
+                if already_streamed or not _status_adapter or not interim_text:
                     return
                 safe_schedule_threadsafe(
                     _status_adapter.send(

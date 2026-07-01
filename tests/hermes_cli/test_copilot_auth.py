@@ -39,6 +39,17 @@ class TestTokenValidation:
 class TestResolveToken:
     """Token resolution with env var priority."""
 
+    def test_disable_copilot_bypasses_token_resolution(self, monkeypatch):
+        from hermes_cli.copilot_auth import resolve_copilot_token
+
+        monkeypatch.setenv("HERMES_DISABLE_COPILOT", "1")
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")
+
+        token, source = resolve_copilot_token()
+
+        assert token == ""
+        assert source == "HERMES_DISABLE_COPILOT"
+
     def test_copilot_github_token_first_priority(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")

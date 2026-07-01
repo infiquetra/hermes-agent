@@ -103,6 +103,15 @@ class TestGetCopilotApiToken:
     """Tests for get_copilot_api_token() — the fallback wrapper."""
 
     @patch("hermes_cli.copilot_auth.exchange_copilot_token")
+    def test_disable_copilot_skips_token_exchange(self, mock_exchange, monkeypatch):
+        from hermes_cli.copilot_auth import get_copilot_api_token
+
+        monkeypatch.setenv("HERMES_DISABLE_COPILOT", "true")
+
+        assert get_copilot_api_token("gho_raw") == ""
+        mock_exchange.assert_not_called()
+
+    @patch("hermes_cli.copilot_auth.exchange_copilot_token")
     def test_returns_exchanged_token(self, mock_exchange):
         from hermes_cli.copilot_auth import get_copilot_api_token
 

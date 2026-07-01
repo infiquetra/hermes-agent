@@ -45,6 +45,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Gateway-only assistant/status chatter controls. These default on for
     # back-compat, but mobile platforms can opt down to final-answer-first.
     "interim_assistant_messages": True,
+    # Speaking those interim messages over Discord voice is noisier than
+    # displaying them in chat, so it stays off unless explicitly opted in.
+    "speak_interim_assistant_messages": False,
     "long_running_notifications": True,
     "busy_ack_detail": True,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
@@ -238,6 +241,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "show_reasoning",
         "streaming",
         "interim_assistant_messages",
+        "speak_interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
     }:
