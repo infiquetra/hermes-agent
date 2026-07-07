@@ -3,11 +3,13 @@
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from cron.jobs import (
     parse_duration,
     parse_schedule,
     compute_next_run,
+    prepare_job_for_create,
     create_job,
     load_jobs,
     save_jobs,
@@ -239,6 +241,24 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_prepare_job_for_create_does_not_persist(self, tmp_cron_dir):
+        job = prepare_job_for_create(
+            prompt="Check server status",
+            schedule="every 1h",
+            name="Server Check",
+            deliver=None,
+            skills=["blogwatcher"],
+            workdir="/tmp",
+        )
+
+        assert job["id"]
+        assert job["name"] == "Server Check"
+        assert job["schedule_display"] == "every 60m"
+        assert job["deliver"] == "local"
+        assert job["skills"] == ["blogwatcher"]
+        assert job["workdir"] == str(Path("/tmp").resolve())
+        assert list_jobs() == []
+
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]

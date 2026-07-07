@@ -1,6 +1,8 @@
 """Tests for hermes_cli.cron command handling."""
 
+import json
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -105,6 +107,91 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_create_dry_run_json_does_not_create_job(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+        code = cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="0 9 * * *",
+                prompt="safe test prompt",
+                name="example",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=["blogwatcher"],
+                script=None,
+                workdir="/tmp",
+                no_agent=False,
+                dry_run=True,
+                json=True,
+            )
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        result = json.loads(out)
+        assert result["success"] is True
+        assert result["dry_run"] is True
+        assert result["would_create"] is True
+        assert result["name"] == "example"
+        assert result["skills"] == ["blogwatcher"]
+        assert result["parsed_schedule"]["kind"] == "cron"
+        assert result["job"]["workdir"] == str(Path("/tmp").resolve())
+        assert result["workdir"] == str(Path("/tmp").resolve())
+        assert result["no_agent"] is False
+        assert list_jobs() == []
+        assert "Gateway is not running" not in out
+
+    def test_create_dry_run_json_reports_validation_error(self, tmp_cron_dir, capsys):
+        code = cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 5m",
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                no_agent=False,
+                dry_run=True,
+                json=True,
+            )
+        )
+
+        assert code == 1
+        result = json.loads(capsys.readouterr().out)
+        assert result["success"] is False
+        assert result["dry_run"] is True
+        assert "requires either prompt or at least one skill" in result["error"]
+        assert list_jobs() == []
+
+    def test_create_json_without_dry_run_is_rejected(self, tmp_cron_dir, capsys):
+        code = cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 5m",
+                prompt="safe test prompt",
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                no_agent=False,
+                dry_run=False,
+                json=True,
+            )
+        )
+
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "--json is only supported with --dry-run" in out
+        assert list_jobs() == []
 
     def test_list_does_not_crash_when_repeat_is_null(self, tmp_cron_dir, capsys):
         """A one-shot job can be persisted with ``"repeat": null``. `cron
