@@ -267,6 +267,7 @@ AUTHOR_MAP = {
     "pwnda.zhang@dbappsecurity.com.cn": "x7peeps",
     "palkin.dominik@gmail.com": "skyc1e",
     "namredips@users.noreply.github.com": "namredips",
+    "namredips@gmail.com": "namredips",  # PR #1 / Team Freya #54 (cron dry-run validation)
     "mihabubnjevic@gmail.com": "whoislikemiha",
     "m24927605@gmail.com": "m24927605",
     "gdeyoung@gmail.com": "gdeyoung",

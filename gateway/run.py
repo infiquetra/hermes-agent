@@ -12088,14 +12088,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
         """Extract Discord guild_id from the raw message object."""
         raw = getattr(event, "raw_message", None)
-        if raw is None:
-            return None
-        # Slash command interaction
-        if hasattr(raw, "guild_id") and raw.guild_id:
-            return int(raw.guild_id)
-        # Regular message
-        if hasattr(raw, "guild") and raw.guild:
-            return raw.guild.id
+        if raw is not None:
+            # Slash command interaction
+            if hasattr(raw, "guild_id") and raw.guild_id:
+                return int(raw.guild_id)
+            # Regular message
+            if hasattr(raw, "guild") and raw.guild:
+                return raw.guild.id
+
+        source = getattr(event, "source", None)
+        source_scope = (
+            getattr(source, "scope_id", None)
+            or getattr(source, "guild_id", None)
+        )
+        if source_scope:
+            try:
+                return int(source_scope)
+            except (TypeError, ValueError):
+                return None
         return None
 
 
@@ -17039,17 +17049,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not _run_still_current():
                     return
                 interim_text = str(text or "").strip()
+                interim_event = MessageEvent(
+                    text=message,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=event_message_id,
+                    channel_prompt=channel_prompt,
+                )
                 if (
                     interim_text
                     and not already_streamed
                     and self._should_send_interim_voice_reply(
-                        event,
+                        interim_event,
                         interim_text,
                         enabled=speak_interim_assistant_messages_enabled,
                     )
                 ):
                     safe_schedule_threadsafe(
-                        self._send_interim_voice_reply(event, interim_text),
+                        self._send_interim_voice_reply(interim_event, interim_text),
                         _loop_for_step,
                         logger=logger,
                         log_message="interim_voice_reply scheduling error",

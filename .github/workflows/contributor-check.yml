@@ -2,6 +2,12 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    inputs:
+      base_ref:
+        description: "Branch ref to compare contributor authors against"
+        required: false
+        type: string
+        default: main
 
 permissions:
   contents: read
@@ -15,9 +21,18 @@ jobs:
           fetch-depth: 0  # Full history needed for git log
 
       - name: Check for unmapped contributor emails
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Get the merge base between this PR and its target branch.
+          # Pushes to main pass the fallback "main" ref.
+          BASE_REF="${BASE_REF:-main}"
+          BASE_REMOTE="origin/${BASE_REF}"
+          if ! git rev-parse --verify --quiet "${BASE_REMOTE}" >/dev/null; then
+            echo "::warning::Base ref ${BASE_REMOTE} was not fetched; falling back to origin/main"
+            BASE_REMOTE="origin/main"
+          fi
+          MERGE_BASE=$(git merge-base "${BASE_REMOTE}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
