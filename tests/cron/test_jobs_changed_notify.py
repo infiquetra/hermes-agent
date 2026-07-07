@@ -83,6 +83,21 @@ def test_tool_create_notifies_provider(temp_home, monkeypatch):
     assert calls == ["changed"]
 
 
+def test_preview_create_does_not_notify_provider(temp_home, monkeypatch):
+    """Dry-run validation must not notify providers because no job changed."""
+    import cron.scheduler as sched
+    calls = []
+    monkeypatch.setattr(sched, "_notify_provider_jobs_changed",
+                        lambda: calls.append("changed"))
+
+    from tools.cronjob_tools import preview_create_job
+
+    out = preview_create_job(prompt="echo hi", schedule="every 5m", name="w")
+    assert out["success"] is True
+    assert out["dry_run"] is True
+    assert calls == []
+
+
 def test_tool_remove_notifies_provider(temp_home, monkeypatch):
     """Removing a job via the tool path invokes on_jobs_changed."""
     import json

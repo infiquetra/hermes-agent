@@ -298,8 +298,7 @@ def cron_create(args):
     # raises GatewayLifecycleBlocked, the `cronjob` tool wrapper catches it and
     # returns it as result["error"], and the `if not result.get("success")`
     # branch below prints it in red and exits 1 — same UX as before.
-    result = _cron_api(
-        action="create",
+    create_kwargs = dict(
         schedule=args.schedule,
         prompt=args.prompt,
         name=getattr(args, "name", None),
@@ -310,6 +309,41 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    json_output = bool(getattr(args, "json", False))
+    if json_output and not dry_run:
+        print(color("--json is only supported with --dry-run for cron create.", Colors.RED))
+        return 1
+
+    if dry_run:
+        from tools.cronjob_tools import preview_create_job
+
+        result = preview_create_job(**create_kwargs)
+        if json_output:
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("success") else 1
+        if not result.get("success"):
+            print(color(f"Failed to validate job: {result.get('error', 'unknown error')}", Colors.RED))
+            return 1
+        print(color(f"Validated job: {result['job_id']} (dry run; not created)", Colors.GREEN))
+        print(f"  Name: {result['name']}")
+        print(f"  Schedule: {result['schedule']}")
+        if result.get("skills"):
+            print(f"  Skills: {', '.join(result['skills'])}")
+        job_data = result.get("job", {})
+        if job_data.get("script"):
+            print(f"  Script: {job_data['script']}")
+        if job_data.get("no_agent"):
+            print("  Mode: no-agent (script stdout delivered directly)")
+        if job_data.get("workdir"):
+            print(f"  Workdir: {job_data['workdir']}")
+        print(f"  Next run: {result['next_run_at']}")
+        return 0
+
+    result = _cron_api(
+        action="create",
+        **create_kwargs,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
