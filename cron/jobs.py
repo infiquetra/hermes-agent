@@ -937,7 +937,7 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
-def create_job(
+def prepare_job_for_create(
     prompt: Optional[str],
     schedule: str,
     name: Optional[str] = None,
@@ -957,7 +957,11 @@ def create_job(
     attach_to_session: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
-    Create a new cron job.
+    Build a cron job record using the same normalization as create_job().
+
+    This function intentionally does not persist the job. It exists so
+    non-mutating validation paths can prove exactly what create_job() would
+    store without appending to jobs.json or notifying scheduler providers.
 
     Args:
         prompt: The prompt to run (must be self-contained, or a task instruction when skill is set).
@@ -1001,7 +1005,7 @@ def create_job(
                 watchdogs and periodic alerts that don't need LLM reasoning.
 
     Returns:
-        The created job dict
+        The normalized job dict that create_job() would persist.
     """
     parsed_schedule = parse_schedule(schedule)
 
@@ -1126,6 +1130,49 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+
+    return job
+
+
+def create_job(
+    prompt: Optional[str],
+    schedule: str,
+    name: Optional[str] = None,
+    repeat: Optional[int] = None,
+    deliver: Optional[str] = None,
+    origin: Optional[Dict[str, Any]] = None,
+    skill: Optional[str] = None,
+    skills: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    script: Optional[str] = None,
+    context_from: Optional[Union[str, List[str]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    workdir: Optional[str] = None,
+    no_agent: bool = False,
+    attach_to_session: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Create and persist a cron job prepared by prepare_job_for_create()."""
+    job = prepare_job_for_create(
+        prompt=prompt,
+        schedule=schedule,
+        name=name,
+        repeat=repeat,
+        deliver=deliver,
+        origin=origin,
+        skill=skill,
+        skills=skills,
+        model=model,
+        provider=provider,
+        base_url=base_url,
+        script=script,
+        context_from=context_from,
+        enabled_toolsets=enabled_toolsets,
+        workdir=workdir,
+        no_agent=no_agent,
+        attach_to_session=attach_to_session,
+    )
 
     with _jobs_lock():
         jobs = load_jobs()

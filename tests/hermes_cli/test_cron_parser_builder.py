@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 from hermes_cli.subcommands.cron import build_cron_parser
 
 
@@ -50,7 +52,7 @@ def test_cron_create_options():
         "cron", "create", "0 9 * * *", "daily task prompt",
         "--name", "daily", "--deliver", "origin", "--repeat", "3",
         "--skill", "a", "--skill", "b", "--no-agent",
-        "--workdir", "/tmp/x",
+        "--workdir", "/tmp/x", "--dry-run", "--json",
     ])
     assert ns.schedule == "0 9 * * *"
     assert ns.prompt == "daily task prompt"
@@ -60,6 +62,20 @@ def test_cron_create_options():
     assert ns.skills == ["a", "b"]
     assert ns.no_agent is True
     assert ns.workdir == "/tmp/x"
+    assert ns.dry_run is True
+    assert ns.json is True
+
+
+def test_cron_create_help_documents_dry_run_json(capsys):
+    parser = _build()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["cron", "create", "--help"])
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--dry-run" in out
+    assert "--json" in out
+    assert "Validate and show the job" in out
 
 
 def test_cron_edit_no_agent_tristate():

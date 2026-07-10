@@ -28,6 +28,7 @@ from cron.jobs import (
     mark_job_run,
     parse_schedule,
     pause_job,
+    prepare_job_for_create,
     remove_job,
     resolve_job_ref,
     resume_job,
@@ -601,6 +602,158 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _validate_create_request(
+    *,
+    prompt: Optional[str],
+    schedule: Optional[str],
+    skill: Optional[str],
+    skills: Optional[List[str]],
+    script: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str],
+    context_from: Optional[Union[str, List[str]]],
+    no_agent: Optional[bool],
+) -> tuple[List[str], Optional[str]]:
+    if not schedule:
+        return [], "schedule is required for create"
+    canonical_skills = _canonical_skills(skill, skills)
+    normalized_no_agent = bool(no_agent)
+    # Job-shape validation differs by mode:
+    #   - no_agent=True -> script is the job; prompt/skills are optional
+    #     (and irrelevant to execution).
+    #   - no_agent=False (default) -> at least one of prompt/skills must
+    #     be set, same as before.
+    if normalized_no_agent:
+        if not script:
+            return (
+                canonical_skills,
+                "create with no_agent=True requires a script — the script is the job.",
+            )
+    elif not prompt and not canonical_skills:
+        return canonical_skills, "create requires either prompt or at least one skill"
+    if prompt:
+        scan_error = _scan_cron_prompt(prompt)
+        if scan_error:
+            return canonical_skills, scan_error
+
+    # Validate script path before storing or previewing.
+    if script:
+        script_error = _validate_cron_script_path(script)
+        if script_error:
+            return canonical_skills, script_error
+
+    # Reject a model-supplied base_url that would route a named provider's
+    # stored credential to an attacker endpoint (F8).
+    base_url_error = _validate_cron_base_url(provider, base_url)
+    if base_url_error:
+        return canonical_skills, base_url_error
+
+    # Validate context_from references existing jobs.
+    if context_from:
+        from cron.jobs import get_job as _get_job
+
+        refs = [context_from] if isinstance(context_from, str) else context_from
+        for ref_id in refs:
+            if not _get_job(ref_id):
+                return (
+                    canonical_skills,
+                    f"context_from job '{ref_id}' not found. "
+                    "Use cronjob(action='list') to see available jobs.",
+                )
+
+    return canonical_skills, None
+
+
+def _create_success_payload(
+    job: Dict[str, Any],
+    *,
+    dry_run: bool = False,
+    user_deliver: Optional[str] = None,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "success": True,
+        "job_id": job["id"],
+        "name": job["name"],
+        "skill": job.get("skill"),
+        "skills": job.get("skills", []),
+        "schedule": job["schedule_display"],
+        "repeat": _repeat_display(job),
+        "deliver": job.get("deliver", "local"),
+        "next_run_at": job["next_run_at"],
+        "job": _format_job(job),
+    }
+    if dry_run:
+        result["dry_run"] = True
+        result["would_create"] = True
+        result["parsed_schedule"] = job.get("schedule")
+        result["script"] = job.get("script")
+        result["no_agent"] = bool(job.get("no_agent"))
+        result["workdir"] = job.get("workdir")
+        result["message"] = f"Cron job '{job['name']}' validated; no job was created."
+        return result
+
+    create_message = f"Cron job '{job['name']}' created."
+    local_notice = _local_delivery_notice(job, user_deliver)
+    if local_notice:
+        create_message = f"{create_message} {local_notice}"
+    result["message"] = create_message
+    return result
+
+
+def preview_create_job(
+    *,
+    prompt: Optional[str] = None,
+    schedule: Optional[str] = None,
+    name: Optional[str] = None,
+    repeat: Optional[int] = None,
+    deliver: Optional[str] = None,
+    skill: Optional[str] = None,
+    skills: Optional[List[str]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    script: Optional[str] = None,
+    context_from: Optional[Union[str, List[str]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    workdir: Optional[str] = None,
+    no_agent: Optional[bool] = None,
+    attach_to_session: Optional[bool] = None,
+) -> Dict[str, Any]:
+    canonical_skills, error = _validate_create_request(
+        prompt=prompt,
+        schedule=schedule,
+        skill=skill,
+        skills=skills,
+        script=script,
+        provider=provider,
+        base_url=base_url,
+        context_from=context_from,
+        no_agent=no_agent,
+    )
+    if error:
+        return {"success": False, "dry_run": True, "error": error}
+
+    job = prepare_job_for_create(
+        prompt=prompt or "",
+        schedule=schedule or "",
+        name=name,
+        repeat=repeat,
+        deliver=_normalize_deliver_param(deliver),
+        origin=_origin_from_env(),
+        skills=canonical_skills,
+        model=_normalize_optional_job_value(model),
+        provider=_normalize_optional_job_value(provider),
+        base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
+        script=_normalize_optional_job_value(script),
+        context_from=context_from,
+        enabled_toolsets=enabled_toolsets or None,
+        workdir=_normalize_optional_job_value(workdir),
+        no_agent=bool(no_agent),
+        attach_to_session=attach_to_session,
+    )
+    return _create_success_payload(job, dry_run=True)
+
+
 def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
@@ -686,56 +839,23 @@ def cronjob(
         normalized = (action or "").strip().lower()
 
         if normalized == "create":
-            if not schedule:
-                return tool_error("schedule is required for create", success=False)
-            canonical_skills = _canonical_skills(skill, skills)
-            _no_agent = bool(no_agent)
-            # Job-shape validation differs by mode:
-            #   - no_agent=True → script is the job; prompt/skills are optional
-            #     (and irrelevant to execution).
-            #   - no_agent=False (default) → at least one of prompt/skills must
-            #     be set, same as before.
-            if _no_agent:
-                if not script:
-                    return tool_error(
-                        "create with no_agent=True requires a script — "
-                        "the script is the job.",
-                        success=False,
-                    )
-            elif not prompt and not canonical_skills:
-                return tool_error("create requires either prompt or at least one skill", success=False)
-            if prompt:
-                scan_error = _scan_cron_prompt(prompt)
-                if scan_error:
-                    return tool_error(scan_error, success=False)
-
-            # Validate script path before storing
-            if script:
-                script_error = _validate_cron_script_path(script)
-                if script_error:
-                    return tool_error(script_error, success=False)
-
-            # Reject a model-supplied base_url that would route a named
-            # provider's stored credential to an attacker endpoint (F8).
-            base_url_error = _validate_cron_base_url(provider, base_url)
-            if base_url_error:
-                return tool_error(base_url_error, success=False)
-
-            # Validate context_from references existing jobs
-            if context_from:
-                from cron.jobs import get_job as _get_job
-                refs = [context_from] if isinstance(context_from, str) else context_from
-                for ref_id in refs:
-                    if not _get_job(ref_id):
-                        return tool_error(
-                            f"context_from job '{ref_id}' not found. "
-                            "Use cronjob(action='list') to see available jobs.",
-                            success=False,
-                        )
+            canonical_skills, create_error = _validate_create_request(
+                prompt=prompt,
+                schedule=schedule,
+                skill=skill,
+                skills=skills,
+                script=script,
+                provider=provider,
+                base_url=base_url,
+                context_from=context_from,
+                no_agent=no_agent,
+            )
+            if create_error:
+                return tool_error(create_error, success=False)
 
             job = create_job(
                 prompt=prompt or "",
-                schedule=schedule,
+                schedule=schedule or "",
                 name=name,
                 repeat=repeat,
                 deliver=_normalize_deliver_param(deliver),
@@ -748,28 +868,15 @@ def cronjob(
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
-                no_agent=_no_agent,
+                no_agent=bool(no_agent),
                 attach_to_session=attach_to_session,
             )
             _notify_provider_jobs_changed_safe()
-            _create_message = f"Cron job '{job['name']}' created."
-            _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
-            if _local_notice:
-                _create_message = f"{_create_message} {_local_notice}"
             return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": _create_message,
-                },
+                _create_success_payload(
+                    job,
+                    user_deliver=_normalize_deliver_param(deliver),
+                ),
                 indent=2,
             )
 

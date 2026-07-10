@@ -39,6 +39,27 @@ class TestTokenValidation:
 class TestResolveToken:
     """Token resolution with env var priority."""
 
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " On "])
+    def test_disable_copilot_bypasses_token_resolution(self, monkeypatch, value):
+        from hermes_cli.copilot_auth import resolve_copilot_token
+
+        monkeypatch.setenv("HERMES_DISABLE_COPILOT", value)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")
+
+        token, source = resolve_copilot_token()
+
+        assert token == ""
+        assert source == "HERMES_DISABLE_COPILOT"
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "anything"])
+    def test_false_disable_values_preserve_token_resolution(self, monkeypatch, value):
+        from hermes_cli.copilot_auth import resolve_copilot_token
+
+        monkeypatch.setenv("HERMES_DISABLE_COPILOT", value)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")
+
+        assert resolve_copilot_token() == ("gho_copilot_first", "COPILOT_GITHUB_TOKEN")
+
     def test_copilot_github_token_first_priority(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")
