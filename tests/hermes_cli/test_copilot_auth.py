@@ -39,16 +39,26 @@ class TestTokenValidation:
 class TestResolveToken:
     """Token resolution with env var priority."""
 
-    def test_disable_copilot_bypasses_token_resolution(self, monkeypatch):
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " On "])
+    def test_disable_copilot_bypasses_token_resolution(self, monkeypatch, value):
         from hermes_cli.copilot_auth import resolve_copilot_token
 
-        monkeypatch.setenv("HERMES_DISABLE_COPILOT", "1")
+        monkeypatch.setenv("HERMES_DISABLE_COPILOT", value)
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")
 
         token, source = resolve_copilot_token()
 
         assert token == ""
         assert source == "HERMES_DISABLE_COPILOT"
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "anything"])
+    def test_false_disable_values_preserve_token_resolution(self, monkeypatch, value):
+        from hermes_cli.copilot_auth import resolve_copilot_token
+
+        monkeypatch.setenv("HERMES_DISABLE_COPILOT", value)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_copilot_first")
+
+        assert resolve_copilot_token() == ("gho_copilot_first", "COPILOT_GITHUB_TOKEN")
 
     def test_copilot_github_token_first_priority(self, monkeypatch):
         from hermes_cli.copilot_auth import resolve_copilot_token
@@ -162,6 +172,34 @@ class TestCopilotDefaultHeaders:
         from hermes_cli.models import copilot_default_headers
         headers = copilot_default_headers()
         assert "x-initiator" in headers
+
+    def test_default_is_agent_turn(self):
+        """Calling with no args preserves backward-compatible default (agent)."""
+        from hermes_cli.models import copilot_default_headers
+        headers = copilot_default_headers()
+        assert headers["x-initiator"] == "agent"
+
+    def test_user_turn_sets_user_initiator(self):
+        """Passing is_agent_turn=False sets x-initiator to 'user'."""
+        from hermes_cli.models import copilot_default_headers
+        headers = copilot_default_headers(is_agent_turn=False)
+        assert headers["x-initiator"] == "user"
+
+    def test_agent_turn_explicit(self):
+        """Explicitly passing is_agent_turn=True sets x-initiator to 'agent'."""
+        from hermes_cli.models import copilot_default_headers
+        headers = copilot_default_headers(is_agent_turn=True)
+        assert headers["x-initiator"] == "agent"
+
+    def test_param_passthrough_both_values(self):
+        """is_agent_turn param correctly maps to x-initiator for both True and False."""
+        from hermes_cli.models import copilot_default_headers
+        for is_agent, expected in [(True, "agent"), (False, "user")]:
+            headers = copilot_default_headers(is_agent_turn=is_agent)
+            assert headers["x-initiator"] == expected, (
+                f"is_agent_turn={is_agent} should produce x-initiator={expected!r}, "
+                f"got {headers['x-initiator']!r}"
+            )
 
 
 class TestApiModeSelection:

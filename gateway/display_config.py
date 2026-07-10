@@ -50,6 +50,11 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "speak_interim_assistant_messages": False,
     "long_running_notifications": True,
     "busy_ack_detail": True,
+    # Whether busy_input_mode=steer sends a visible "Steered into current run"
+    # acknowledgment after successfully injecting the user's mid-turn message.
+    # Disable when the platform should steer silently (the text still lands in
+    # the active run; only the confirmation echo is suppressed).
+    "busy_steer_ack_enabled": True,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
     # deletion (e.g. Telegram). Off by default — progress is still shown
@@ -236,7 +241,12 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         if value is True:
             return "all"
-        return str(value).lower()
+        val = str(value).strip().lower()
+        if val in {"false", "0", "no"}:
+            return "off"
+        if val in {"true", "1", "yes", "on"}:
+            return "all"
+        return val if val in {"off", "new", "all", "verbose", "log"} else "all"
     if setting in {
         "show_reasoning",
         "streaming",
@@ -244,9 +254,14 @@ def _normalise(setting: str, value: Any) -> Any:
         "speak_interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "busy_steer_ack_enabled",
+        "thinking_progress",
     }:
         if isinstance(value, str):
-            return value.lower() in {"true", "1", "yes", "on"}
+            val = value.strip().lower()
+            if val == "generic" and setting == "long_running_notifications":
+                return "generic"
+            return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
     if setting == "cleanup_progress":
         if isinstance(value, str):

@@ -435,7 +435,7 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
     individual accounts.
     """
     if copilot_disabled():
-        return ""
+        return "", None
 
     if not raw_token:
         return raw_token, None

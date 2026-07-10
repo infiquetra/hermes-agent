@@ -108,7 +108,7 @@ class TestGetCopilotApiToken:
 
         monkeypatch.setenv("HERMES_DISABLE_COPILOT", "true")
 
-        assert get_copilot_api_token("gho_raw") == ""
+        assert get_copilot_api_token("gho_raw") == ("", None)
         mock_exchange.assert_not_called()
 
     @patch("hermes_cli.copilot_auth.exchange_copilot_token")

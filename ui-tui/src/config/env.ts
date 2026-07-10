@@ -24,6 +24,7 @@ const parseToggle = (v?: string): boolean | null => {
 }
 
 export const TERMUX_TUI_MODE = isTermuxTuiMode()
+export const STARTUP_TITLE = (process.env.HERMES_TUI_SESSION_TITLE ?? '').trim()
 
 export const STARTUP_RESUME_ID = (process.env.HERMES_TUI_RESUME ?? '').trim()
 export const STARTUP_QUERY = (process.env.HERMES_TUI_QUERY ?? '').trim()

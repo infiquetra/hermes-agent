@@ -29,8 +29,8 @@ jobs:
           BASE_REF="${BASE_REF:-main}"
           BASE_REMOTE="origin/${BASE_REF}"
           if ! git rev-parse --verify --quiet "${BASE_REMOTE}" >/dev/null; then
-            echo "::warning::Base ref ${BASE_REMOTE} was not fetched; falling back to origin/main"
-            BASE_REMOTE="origin/main"
+            echo "::error::Base ref ${BASE_REMOTE} was not fetched"
+            exit 1
           fi
           MERGE_BASE=$(git merge-base "${BASE_REMOTE}" HEAD)
 
