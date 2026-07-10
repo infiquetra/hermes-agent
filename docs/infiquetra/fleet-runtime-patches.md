@@ -97,11 +97,13 @@ patch.
 
 ## Required Fork CI and Attribution Support
 
-The following non-runtime paths are maintained in a separate commit and are
-not fleet behavior patches: `.github/workflows/ci.yml`,
-`.github/workflows/contributor-check.yml`, `scripts/release.py`, and
-`tests/ci/test_contributor_check_workflow.py`. They make fork pull-request
-attribution use the actual PR base ref and recognize the existing fork author.
+The following non-runtime paths are maintained in separate commits and are not
+fleet behavior patches: `.github/workflows/ci.yml`,
+`.github/workflows/contributor-check.yml`, `scripts/release.py`,
+`tests/ci/test_contributor_check_workflow.py`, and
+`tests/agent/test_anthropic_adapter.py`. They make fork pull-request attribution
+use the actual PR base ref, recognize the existing fork author, and keep the
+Anthropic setup-token subprocess tests isolated from the macOS Keychain probe.
 
 ## Complete Candidate Verification
 
@@ -113,6 +115,6 @@ scripts/run_tests.sh
 ```
 
 The diff from the audited upstream base must contain exactly the 24
-runtime/doc/test/manifest paths named above plus the four required CI and
-attribution paths. Neither the retired CLI status-bar behavior nor npm
-normalization is a carried patch.
+runtime/doc/test/manifest paths named above plus the five required CI,
+attribution, and test-isolation paths. Neither the retired CLI status-bar
+behavior nor npm normalization is a carried patch.
