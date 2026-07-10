@@ -333,6 +333,26 @@ class TestPlatformDefaults:
         assert resolve_display_setting(config, "telegram", "long_running_notifications") is False
         assert resolve_display_setting(config, "telegram", "busy_ack_detail") is True
 
+    def test_spoken_interim_assistant_messages_default_off(self):
+        """Interim assistant speech is opt-in even on Discord voice."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "discord", "speak_interim_assistant_messages") is False
+
+    def test_spoken_interim_assistant_messages_can_opt_in_per_platform(self):
+        """Discord can opt in without affecting other platforms."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "discord": {"speak_interim_assistant_messages": "on"},
+                }
+            }
+        }
+        assert resolve_display_setting(config, "discord", "speak_interim_assistant_messages") is True
+        assert resolve_display_setting(config, "telegram", "speak_interim_assistant_messages") is False
+
 
 # ---------------------------------------------------------------------------
 # Config migration: tool_progress_overrides → display.platforms
