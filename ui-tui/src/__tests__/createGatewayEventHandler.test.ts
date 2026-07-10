@@ -1,5 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const startupEnv = vi.hoisted(() => ({ title: '' }))
+
+vi.mock('../config/env.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../config/env.js')>()
+
+  return {
+    ...actual,
+    get STARTUP_TITLE() {
+      return startupEnv.title
+    }
+  }
+})
+
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { turnController } from '../app/turnController.js'
@@ -59,6 +72,7 @@ const buildCtx = (appended: Msg[]) =>
 
 describe('createGatewayEventHandler', () => {
   beforeEach(() => {
+    startupEnv.title = ''
     resetOverlayState()
     resetUiState()
     resetTurnState()
@@ -732,6 +746,7 @@ describe('createGatewayEventHandler', () => {
     ctx.session.newSession = newSession
     ctx.session.resumeById = resumeById
     ctx.session.STARTUP_RESUME_ID = ''
+    startupEnv.title = 'Mimir Council'
     ctx.gateway.rpc = vi.fn(async (method: string) => {
       if (method === 'config.get') {
         return { config: { display: { tui_auto_resume_recent: false } } }
@@ -743,6 +758,7 @@ describe('createGatewayEventHandler', () => {
     createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
 
     await vi.waitFor(() => expect(newSession).toHaveBeenCalled())
+    expect(newSession).toHaveBeenCalledWith(undefined, 'Mimir Council')
     expect(resumeById).not.toHaveBeenCalled()
   })
 
@@ -758,6 +774,7 @@ describe('createGatewayEventHandler', () => {
     ctx.session.resumeById = resumeById.mockImplementation(() => patchUiState({ status: 'resuming…' }))
     ctx.session.STARTUP_RESUME_ID = ''
     ctx.session.recoverSidRef = ref<null | string>('sess-crashed')
+    startupEnv.title = 'must not replace recovered title'
 
     const onEvent = createGatewayEventHandler(ctx)
 
@@ -780,6 +797,7 @@ describe('createGatewayEventHandler', () => {
     ctx.session.newSession = newSession
     ctx.session.resumeById = resumeById
     ctx.session.STARTUP_RESUME_ID = ''
+    startupEnv.title = 'must not replace resumed title'
     ctx.gateway.rpc = vi.fn(async (method: string) => {
       if (method === 'config.get') {
         return { config: { display: { tui_auto_resume_recent: true } } }
@@ -807,6 +825,7 @@ describe('createGatewayEventHandler', () => {
     ctx.session.newSession = newSession
     ctx.session.resumeById = resumeById
     ctx.session.STARTUP_RESUME_ID = ''
+    startupEnv.title = 'Mimir Council'
     ctx.gateway.rpc = vi.fn(async (method: string) => {
       if (method === 'config.get') {
         return { config: { display: { tui_auto_resume_recent: true } } }
@@ -822,6 +841,7 @@ describe('createGatewayEventHandler', () => {
     createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
 
     await vi.waitFor(() => expect(newSession).toHaveBeenCalled())
+    expect(newSession).toHaveBeenCalledWith(undefined, 'Mimir Council')
     expect(resumeById).not.toHaveBeenCalled()
   })
 
@@ -834,6 +854,7 @@ describe('createGatewayEventHandler', () => {
     ctx.session.newSession = newSession
     ctx.session.resumeById = resumeById
     ctx.session.STARTUP_RESUME_ID = ''
+    startupEnv.title = 'Mimir Council'
     ctx.gateway.rpc = vi.fn(async (method: string) => {
       if (method === 'config.get') {
         throw new Error('gateway timeout')
@@ -845,7 +866,38 @@ describe('createGatewayEventHandler', () => {
     createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
 
     await vi.waitFor(() => expect(newSession).toHaveBeenCalled())
+    expect(newSession).toHaveBeenCalledWith(undefined, 'Mimir Council')
     expect(resumeById).not.toHaveBeenCalled()
+  })
+
+  it('passes undefined when the startup title is absent', async () => {
+    const appended: Msg[] = []
+    const newSession = vi.fn()
+    const ctx = buildCtx(appended)
+
+    ctx.session.newSession = newSession
+    ctx.session.STARTUP_RESUME_ID = ''
+    ctx.gateway.rpc = vi.fn(async (method: string) => {
+      if (method === 'config.get') {
+        return { config: { display: { tui_auto_resume_recent: false } } }
+      }
+
+      return null
+    })
+
+    createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
+
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalledWith(undefined, undefined))
+  })
+
+  it('trims a whitespace-only startup title to empty', async () => {
+    vi.stubEnv('HERMES_TUI_SESSION_TITLE', '   ')
+    vi.resetModules()
+
+    const actualEnv = await vi.importActual<typeof import('../config/env.js')>('../config/env.js')
+
+    expect(actualEnv.STARTUP_TITLE).toBe('')
+    vi.unstubAllEnvs()
   })
 
   it('on gateway.ready when session.most_recent rejects, falls back to new session', async () => {

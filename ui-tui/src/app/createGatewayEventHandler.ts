@@ -1,4 +1,4 @@
-import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
+import { STARTUP_IMAGE, STARTUP_QUERY, STARTUP_TITLE } from '../config/env.js'
 import { STREAM_BATCH_MS } from '../config/timing.js'
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import type {
@@ -372,7 +372,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       .then(cfg => {
         if (!cfg?.config?.display?.tui_auto_resume_recent) {
           patchUiState({ status: 'forging session…' })
-          newSession()
+          newSession(undefined, STARTUP_TITLE || undefined)
           scheduleStartupPrompt()
 
           return
@@ -390,13 +390,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           }
 
           patchUiState({ status: 'forging session…' })
-          newSession()
+          newSession(undefined, STARTUP_TITLE || undefined)
           scheduleStartupPrompt()
         })
       })
       .catch(() => {
         patchUiState({ status: 'forging session…' })
-        newSession()
+        newSession(undefined, STARTUP_TITLE || undefined)
         scheduleStartupPrompt()
       })
   }
