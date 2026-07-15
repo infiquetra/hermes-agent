@@ -57,6 +57,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_budget_status",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -137,7 +138,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_unblock", "kanban_budget_activate", "kanban_budget_status",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -977,6 +978,93 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def test_budget_activate_status_and_worker_create_inheritance(
+    monkeypatch,
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    activated = json.loads(kt._handle_budget_activate({
+        "run_id": "tool-run",
+        "classifier_version": "size-classifier/v1",
+        "classifier_evidence_digest": "sha256:tool",
+        "proposed_class": "tiny",
+        "initial_class": "tiny",
+        "classification_reason": "tool fixture",
+        "classification_authority_ref": "github://issue/89#accepted",
+    }))
+    assert activated["ok"] is True
+    assert activated["budget"]["topology_count"] == 1
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="budgeted worker",
+            assignee="test-worker",
+            idempotency_key="tool-run:parent",
+            budget_run_id="tool-run",
+        )
+        assert kb.claim_task(conn, parent) is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    child_out = json.loads(kt._handle_create({
+        "title": "budgeted child",
+        "assignee": "peer",
+        "idempotency_key": "tool-run:child",
+        "workspace_kind": "scratch",
+    }))
+    assert child_out["ok"] is True
+    assert child_out["budget_run_id"] == "tool-run"
+
+    status = json.loads(kt._handle_budget_status({}))
+    assert status["ok"] is True
+    assert status["budget"]["run_id"] == "tool-run"
+    assert status["budget"]["topology_count"] == 3
+
+
+def test_budgeted_worker_cannot_escape_to_another_run(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        for run_id in ("run-a", "run-b"):
+            kb.activate_card_budget(
+                conn,
+                run_id=run_id,
+                classifier_version="size-classifier/v1",
+                classifier_evidence_digest=f"sha256:{run_id}",
+                proposed_class="tiny",
+                initial_class="tiny",
+                classification_reason="tool fixture",
+                classification_authority_ref="github://issue/89#accepted",
+            )
+        parent = kb.create_task(
+            conn,
+            title="budgeted worker",
+            assignee="test-worker",
+            idempotency_key="run-a:parent",
+            budget_run_id="run-a",
+        )
+        kb.claim_task(conn, parent)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent)
+
+    denied = json.loads(kt._handle_create({
+        "title": "escape",
+        "assignee": "peer",
+        "idempotency_key": "run-b:child",
+        "budget_run_id": "run-b",
+    }))
+    assert "different budget run" in denied["error"]
 
 
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):

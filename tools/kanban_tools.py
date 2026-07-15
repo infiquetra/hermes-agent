@@ -353,6 +353,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "budget_run_id": task.budget_run_id,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -398,6 +399,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "budget_run_id": t.budget_run_id,
                 }
 
             def _run_dict(r):
@@ -871,6 +873,7 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    budget_run_id = args.get("budget_run_id")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -895,19 +898,31 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _self_task = kb.get_task(conn, _self_tid) if _self_tid else None
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
-            if _inherit_workspace:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
+            if (
+                _inherit_workspace
+                and _self_task is not None
+                and _self_task.workspace_kind
+            ):
+                workspace_kind = _self_task.workspace_kind
+                workspace_path = _self_task.workspace_path
+                # Keep follow-up children inside the same project so the
+                # whole subtree shares one repo + branch convention.
+                if project_id is None and _self_task.project_id:
+                    project_id = _self_task.project_id
+            if _self_task is not None and _self_task.budget_run_id:
+                if (
+                    budget_run_id
+                    and str(budget_run_id) != _self_task.budget_run_id
+                ):
+                    return tool_error(
+                        "a budgeted worker cannot create work in a different "
+                        "budget run"
+                    )
+                budget_run_id = _self_task.budget_run_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -933,6 +948,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                budget_run_id=budget_run_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -940,14 +956,84 @@ def _handle_create(args: dict, **kw) -> str:
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
+                budget_run_id=new_task.budget_run_id if new_task else None,
             )
         finally:
             conn.close()
     except ValueError as e:
+        from hermes_cli.kanban_db import BudgetAdmissionDenied
+        if isinstance(e, BudgetAdmissionDenied):
+            return json.dumps({
+                "ok": False,
+                "error": str(e),
+                "budget_denial": e.as_dict(),
+            })
         return tool_error(f"kanban_create: {e}")
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _handle_budget_activate(args: dict, **kw) -> str:
+    """Activate an immutable card-count/v1 run and tracking root."""
+    guard = _require_orchestrator_tool("kanban_budget_activate")
+    if guard:
+        return guard
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            status = kb.activate_card_budget(
+                conn,
+                run_id=args.get("run_id"),
+                classifier_version=args.get("classifier_version"),
+                classifier_evidence_digest=args.get(
+                    "classifier_evidence_digest"
+                ),
+                proposed_class=args.get("proposed_class"),
+                initial_class=args.get("initial_class"),
+                classification_reason=args.get("classification_reason"),
+                classification_authority_ref=args.get(
+                    "classification_authority_ref"
+                ),
+                plan_card_budget=args.get("plan_card_budget"),
+                predecessor_run_id=args.get("predecessor_run_id"),
+                successor_authority_ref=args.get("successor_authority_ref"),
+            )
+            return _ok(budget=status)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_budget_activate: {e}")
+    except Exception as e:
+        logger.exception("kanban_budget_activate failed")
+        return tool_error(f"kanban_budget_activate: {e}")
+
+
+def _handle_budget_status(args: dict, **kw) -> str:
+    """Read authoritative derived counts and recent budget receipts."""
+    run_id = str(args.get("run_id") or "").strip() or None
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if run_id is None:
+                task_id = os.environ.get("HERMES_KANBAN_TASK")
+                task = kb.get_task(conn, task_id) if task_id else None
+                run_id = task.budget_run_id if task else None
+            if not run_id:
+                return tool_error(
+                    "run_id is required unless the current worker task is "
+                    "bound to a card budget"
+                )
+            return _ok(budget=kb.get_card_budget_status(conn, run_id))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_budget_status: {e}")
+    except Exception as e:
+        logger.exception("kanban_budget_status failed")
+        return tool_error(f"kanban_budget_status: {e}")
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -1487,6 +1573,15 @@ KANBAN_CREATE_SCHEMA = {
                     "a duplicate. Useful for retry-safe automation."
                 ),
             },
+            "budget_run_id": {
+                "type": "string",
+                "description": (
+                    "Immutable card-count/v1 run id. Required for direct "
+                    "budgeted creation; inherited automatically when the "
+                    "calling worker is already bound to a budget run. "
+                    "Budgeted creates also require idempotency_key."
+                ),
+            },
             "max_runtime_seconds": {
                 "type": "integer",
                 "description": (
@@ -1564,6 +1659,99 @@ KANBAN_UNBLOCK_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["task_id"],
+    },
+}
+
+KANBAN_BUDGET_ACTIVATE_SCHEMA = {
+    "name": "kanban_budget_activate",
+    "description": (
+        "Activate one immutable card-count/v1 run from accepted classifier "
+        "evidence. Creates a terminal tracking root that consumes one "
+        "topology unit. Exact replays are idempotent; conflicting replays "
+        "fail. Orchestrator-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "description": "Stable unique identifier for this budget run.",
+            },
+            "classifier_version": {
+                "type": "string",
+                "description": "Version of the classifier that produced the proposal.",
+            },
+            "classifier_evidence_digest": {
+                "type": "string",
+                "description": "Digest binding the complete classifier evidence.",
+            },
+            "proposed_class": {
+                "type": "string",
+                "enum": ["tiny", "small", "medium", "large"],
+                "description": "Mimir's original proposed size class.",
+            },
+            "initial_class": {
+                "type": "string",
+                "enum": ["tiny", "small", "medium", "large"],
+                "description": "Accepted immutable size class for this run.",
+            },
+            "classification_reason": {
+                "type": "string",
+                "description": "Concise evidence-backed classification rationale.",
+            },
+            "classification_authority_ref": {
+                "type": "string",
+                "description": "Authenticated acceptance receipt or authority reference.",
+            },
+            "plan_card_budget": {
+                "type": "integer",
+                "description": (
+                    "Positive complete-lifecycle plan budget for large runs. "
+                    "Omit for tiny, small, and medium."
+                ),
+            },
+            "predecessor_run_id": {
+                "type": "string",
+                "description": "Wedged predecessor replaced by this successor run.",
+            },
+            "successor_authority_ref": {
+                "type": "string",
+                "description": (
+                    "Authenticated operator receipt authorizing the successor. "
+                    "Required with predecessor_run_id."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [
+            "run_id", "classifier_version", "classifier_evidence_digest",
+            "proposed_class", "initial_class", "classification_reason",
+            "classification_authority_ref",
+        ],
+    },
+}
+
+KANBAN_BUDGET_STATUS_SCHEMA = {
+    "name": "kanban_budget_status",
+    "description": (
+        "Read the authoritative card-count/v1 projection derived from "
+        "immutable admissions and native task-run attempts, including "
+        "classification, limits, counts, successor links, and recent "
+        "soft-overrun or hard-stop receipts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "description": (
+                    "Budget run id. Optional for a worker whose current task "
+                    "is already bound to a budget run."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
     },
 }
 
@@ -1651,6 +1839,24 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_budget_activate",
+    toolset="kanban",
+    schema=KANBAN_BUDGET_ACTIVATE_SCHEMA,
+    handler=_handle_budget_activate,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="📏",
+)
+
+registry.register(
+    name="kanban_budget_status",
+    toolset="kanban",
+    schema=KANBAN_BUDGET_STATUS_SCHEMA,
+    handler=_handle_budget_status,
+    check_fn=_check_kanban_mode,
+    emoji="📊",
 )
 
 registry.register(

@@ -136,6 +136,40 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+CARD_COUNT_POLICY_VERSION = "card-count/v1"
+CARD_BUDGET_CLASS_LIMITS: dict[str, tuple[int, int]] = {
+    "tiny": (6, 10),
+    "small": (10, 16),
+    "medium": (18, 28),
+}
+VALID_CARD_BUDGET_STATES = {"active", "wedged", "superseded"}
+
+
+class BudgetAdmissionDenied(ValueError):
+    """A budgeted create was durably rejected before task admission."""
+
+    def __init__(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        projection: Optional[dict[str, Any]] = None,
+        trigger: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        self.projection = projection
+        self.trigger = trigger
+        super().__init__(f"card budget {run_id} denied admission: {reason}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "reason": self.reason,
+            "projection": self.projection,
+            "trigger": self.trigger,
+        }
+
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
@@ -914,6 +948,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Immutable binding to a card-count/v1 budget run. NULL preserves the
+    # pre-budget behavior for existing boards and ordinary Hermes tasks.
+    budget_run_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -997,6 +1034,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            budget_run_id=(
+                row["budget_run_id"] if "budget_run_id" in keys else None
             ),
         )
 
@@ -1175,7 +1215,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional immutable binding to a card-count/v1 run. Enforcement is
+    -- opt-in; NULL tasks retain the historical unmetered behavior.
+    budget_run_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1263,6 +1306,65 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Immutable classification and limit record for one card-count/v1 run.
+-- Counts are deliberately absent: they are derived from admissions and
+-- task_runs so restarts, archives, and retries cannot refund work.
+CREATE TABLE IF NOT EXISTS card_budget_runs (
+    id                           TEXT PRIMARY KEY,
+    card_count_policy_version    TEXT NOT NULL,
+    classifier_version           TEXT NOT NULL,
+    classifier_evidence_digest   TEXT NOT NULL,
+    proposed_class               TEXT NOT NULL,
+    initial_class                TEXT NOT NULL,
+    current_class                TEXT NOT NULL,
+    classification_reason        TEXT NOT NULL,
+    classification_authority_ref TEXT NOT NULL,
+    plan_card_budget             INTEGER,
+    soft_card_limit              INTEGER NOT NULL,
+    hard_card_limit              INTEGER NOT NULL,
+    state                        TEXT NOT NULL DEFAULT 'active',
+    hard_stop_reason             TEXT,
+    root_task_id                 TEXT NOT NULL UNIQUE,
+    predecessor_run_id           TEXT,
+    successor_run_id             TEXT,
+    successor_authority_ref      TEXT,
+    created_at                   INTEGER NOT NULL,
+    wedged_at                    INTEGER,
+    superseded_at                INTEGER,
+    CHECK (state IN ('active', 'wedged', 'superseded')),
+    CHECK (soft_card_limit > 0),
+    CHECK (hard_card_limit >= soft_card_limit),
+    CHECK (current_class = initial_class),
+    FOREIGN KEY (predecessor_run_id) REFERENCES card_budget_runs(id),
+    FOREIGN KEY (successor_run_id) REFERENCES card_budget_runs(id)
+);
+
+-- One immutable topology unit per admitted durable task.
+CREATE TABLE IF NOT EXISTS card_budget_admissions (
+    run_id          TEXT NOT NULL,
+    task_id         TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
+    admission_kind  TEXT NOT NULL,
+    admitted_at     INTEGER NOT NULL,
+    PRIMARY KEY (run_id, task_id),
+    UNIQUE (run_id, idempotency_key),
+    FOREIGN KEY (run_id) REFERENCES card_budget_runs(id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+
+-- Durable soft-overrun and hard-stop receipts. event_key makes retries and
+-- dispatcher polling idempotent without discarding the exact trigger.
+CREATE TABLE IF NOT EXISTS card_budget_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     TEXT NOT NULL,
+    event_key  TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (run_id, event_key),
+    FOREIGN KEY (run_id) REFERENCES card_budget_runs(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1273,6 +1375,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_budget_admissions_run ON card_budget_admissions(run_id, admitted_at);
+CREATE INDEX IF NOT EXISTS idx_budget_events_run     ON card_budget_events(run_id, id);
 """
 
 
@@ -1986,6 +2090,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "budget_run_id" not in cols:
+        # Opt-in immutable card-count/v1 binding. Existing tasks remain NULL
+        # and preserve their historical unmetered behavior.
+        _add_column_if_missing(
+            conn, "tasks", "budget_run_id", "budget_run_id TEXT"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -1999,6 +2110,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_budget_run "
+        "ON tasks(budget_run_id)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2383,6 +2498,690 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _card_budget_limits(
+    size_class: str,
+    plan_card_budget: Optional[int],
+) -> tuple[int, int, Optional[int]]:
+    normalized = str(size_class or "").strip().lower()
+    if normalized in CARD_BUDGET_CLASS_LIMITS:
+        if plan_card_budget is not None:
+            raise ValueError(
+                "plan_card_budget is only valid for the large size class"
+            )
+        soft, hard = CARD_BUDGET_CLASS_LIMITS[normalized]
+        return soft, hard, None
+    if normalized != "large":
+        raise ValueError(
+            "size class must be one of tiny, small, medium, or large"
+        )
+    if plan_card_budget is None:
+        raise ValueError("large runs require a positive plan_card_budget")
+    try:
+        budget = int(plan_card_budget)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("plan_card_budget must be a positive integer") from exc
+    if budget <= 0:
+        raise ValueError("plan_card_budget must be a positive integer")
+    return budget, (budget * 130 + 99) // 100, budget
+
+
+def _budget_run_row(
+    conn: sqlite3.Connection,
+    run_id: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM card_budget_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+
+
+def _budget_row_error(row: sqlite3.Row) -> Optional[str]:
+    if row["card_count_policy_version"] != CARD_COUNT_POLICY_VERSION:
+        return (
+            "unsupported card-count policy version "
+            f"{row['card_count_policy_version']!r}"
+        )
+    if row["state"] not in VALID_CARD_BUDGET_STATES:
+        return f"invalid budget state {row['state']!r}"
+    if row["current_class"] != row["initial_class"]:
+        return "current_class differs from immutable initial_class"
+    try:
+        expected_soft, expected_hard, expected_plan = _card_budget_limits(
+            row["initial_class"], row["plan_card_budget"]
+        )
+    except ValueError as exc:
+        return str(exc)
+    if (
+        int(row["soft_card_limit"]) != expected_soft
+        or int(row["hard_card_limit"]) != expected_hard
+        or row["plan_card_budget"] != expected_plan
+    ):
+        return "persisted class limits do not match card-count/v1"
+    return None
+
+
+def _budget_counts(
+    conn: sqlite3.Connection,
+    run_id: str,
+) -> dict[str, int]:
+    topology_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM card_budget_admissions WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    attempt_row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT CASE WHEN tr.id IS NOT NULL THEN a.task_id END)
+                   AS distinct_executed,
+               COUNT(tr.id) AS execution_attempts
+          FROM card_budget_admissions a
+          LEFT JOIN task_runs tr ON tr.task_id = a.task_id
+         WHERE a.run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    topology = int(topology_row["n"] if topology_row else 0)
+    distinct_executed = int(
+        attempt_row["distinct_executed"] if attempt_row else 0
+    )
+    execution_attempts = int(
+        attempt_row["execution_attempts"] if attempt_row else 0
+    )
+    retry_dispatches = execution_attempts - distinct_executed
+    return {
+        "topology_count": topology,
+        "distinct_executed_card_count": distinct_executed,
+        "execution_attempt_count": execution_attempts,
+        "retry_dispatch_count": retry_dispatches,
+        "consumed_card_count": topology + retry_dispatches,
+    }
+
+
+def _budget_projection(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> dict[str, Any]:
+    counts = _budget_counts(conn, row["id"])
+    return {
+        "run_id": row["id"],
+        "card_count_policy_version": row["card_count_policy_version"],
+        "classifier_version": row["classifier_version"],
+        "classifier_evidence_digest": row["classifier_evidence_digest"],
+        "proposed_class": row["proposed_class"],
+        "initial_class": row["initial_class"],
+        "current_class": row["current_class"],
+        "classification_reason": row["classification_reason"],
+        "classification_authority_ref": row["classification_authority_ref"],
+        "plan_card_budget": row["plan_card_budget"],
+        "soft_card_limit": int(row["soft_card_limit"]),
+        "hard_card_limit": int(row["hard_card_limit"]),
+        **counts,
+        "soft_overrun_required": (
+            counts["consumed_card_count"] > int(row["soft_card_limit"])
+        ),
+        "hard_stop_reason": row["hard_stop_reason"],
+        "predecessor_run_id": row["predecessor_run_id"],
+        "successor_run_id": row["successor_run_id"],
+        "successor_authority_ref": row["successor_authority_ref"],
+        "state": row["state"],
+        "root_task_id": row["root_task_id"],
+        "created_at": int(row["created_at"]),
+        "wedged_at": row["wedged_at"],
+        "superseded_at": row["superseded_at"],
+    }
+
+
+def get_card_budget_status(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    event_limit: int = 50,
+) -> dict[str, Any]:
+    """Return the authoritative derived projection for one budget run."""
+    normalized = str(run_id or "").strip()
+    if not normalized:
+        raise ValueError("budget run_id is required")
+    row = _budget_run_row(conn, normalized)
+    if row is None:
+        raise ValueError(f"unknown card budget run {normalized!r}")
+    projection = _budget_projection(conn, row)
+    limit = max(0, min(int(event_limit), 200))
+    events = conn.execute(
+        "SELECT kind, event_key, payload, created_at "
+        "FROM card_budget_events WHERE run_id = ? "
+        "ORDER BY id DESC LIMIT ?",
+        (normalized, limit),
+    ).fetchall()
+    projection["events"] = [
+        {
+            "kind": event["kind"],
+            "event_key": event["event_key"],
+            "payload": json.loads(event["payload"]),
+            "created_at": int(event["created_at"]),
+        }
+        for event in reversed(events)
+    ]
+    return projection
+
+
+def _append_budget_event(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    event_key: str,
+    kind: str,
+    payload: dict[str, Any],
+    created_at: Optional[int] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO card_budget_events (
+            run_id, event_key, kind, payload, created_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            event_key,
+            kind,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            int(created_at if created_at is not None else time.time()),
+        ),
+    )
+
+
+def _budget_preflight(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    delta: int,
+    trigger_kind: str,
+    trigger_id: str,
+    attempt: Optional[int] = None,
+    trigger_metadata: Optional[dict[str, Any]] = None,
+) -> tuple[bool, dict[str, Any], Optional[str]]:
+    """Check one topology/retry unit inside the caller's write txn.
+
+    Returns ``(allowed, projection, reason)``. A hard denial is committed as
+    a run wedge and event by the caller's transaction; this helper never
+    raises after writing, which prevents rollback of the evidence receipt.
+    """
+    row = _budget_run_row(conn, run_id)
+    if row is None:
+        return False, {"run_id": run_id}, "budget run is missing"
+    row_error = _budget_row_error(row)
+    if row_error:
+        projection = _budget_projection(conn, row)
+        reason = f"malformed budget run: {row_error}"
+    elif row["state"] != "active":
+        projection = _budget_projection(conn, row)
+        reason = (
+            row["hard_stop_reason"]
+            or f"budget run is {row['state']} and cannot admit more work"
+        )
+        return False, projection, reason
+    else:
+        projection = _budget_projection(conn, row)
+        reason = ""
+
+    current = int(projection.get("consumed_card_count", 0))
+    proposed = current + int(delta)
+    trigger = {
+        "kind": trigger_kind,
+        "id": trigger_id,
+        "attempt": attempt,
+        **(trigger_metadata or {}),
+    }
+    evidence = {
+        "classifier_evidence_digest": row["classifier_evidence_digest"],
+        "classification_authority_ref": row["classification_authority_ref"],
+    }
+    if reason or proposed > int(row["hard_card_limit"]):
+        if not reason:
+            reason = (
+                f"proposed consumed card count {proposed} exceeds hard limit "
+                f"{int(row['hard_card_limit'])}"
+            )
+        now = int(time.time())
+        conn.execute(
+            "UPDATE card_budget_runs "
+            "SET state = 'wedged', hard_stop_reason = COALESCE(hard_stop_reason, ?), "
+            "    wedged_at = COALESCE(wedged_at, ?) "
+            "WHERE id = ? AND state = 'active'",
+            (reason, now, run_id),
+        )
+        payload = {
+            "current_consumed_count": current,
+            "proposed_consumed_count": proposed,
+            "soft_card_limit": int(row["soft_card_limit"]),
+            "hard_card_limit": int(row["hard_card_limit"]),
+            "trigger": trigger,
+            "reason": reason,
+            "evidence": evidence,
+        }
+        _append_budget_event(
+            conn,
+            run_id,
+            event_key=f"hard-stop:{trigger_kind}:{trigger_id}:{attempt or 0}",
+            kind="hard_stop",
+            payload=payload,
+            created_at=now,
+        )
+        wedged = _budget_run_row(conn, run_id)
+        if wedged is None:  # pragma: no cover - protected by the write lock
+            raise RuntimeError(f"budget run {run_id!r} disappeared mid-transaction")
+        return False, _budget_projection(conn, wedged), reason
+
+    if delta > 0 and proposed > int(row["soft_card_limit"]):
+        _append_budget_event(
+            conn,
+            run_id,
+            event_key=f"soft-overrun:{trigger_kind}:{trigger_id}:{attempt or 0}",
+            kind="soft_overrun_required",
+            payload={
+                "current_consumed_count": current,
+                "proposed_consumed_count": proposed,
+                "soft_card_limit": int(row["soft_card_limit"]),
+                "hard_card_limit": int(row["hard_card_limit"]),
+                "trigger": trigger,
+                "evidence": evidence,
+            },
+        )
+    return True, projection, None
+
+
+def activate_card_budget(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    classifier_version: str,
+    classifier_evidence_digest: str,
+    proposed_class: str,
+    initial_class: str,
+    classification_reason: str,
+    classification_authority_ref: str,
+    plan_card_budget: Optional[int] = None,
+    predecessor_run_id: Optional[str] = None,
+    successor_authority_ref: Optional[str] = None,
+) -> dict[str, Any]:
+    """Activate one immutable card-count/v1 run and terminal root card."""
+    values = {
+        "run_id": str(run_id or "").strip(),
+        "classifier_version": str(classifier_version or "").strip(),
+        "classifier_evidence_digest": str(
+            classifier_evidence_digest or ""
+        ).strip(),
+        "proposed_class": str(proposed_class or "").strip().lower(),
+        "initial_class": str(initial_class or "").strip().lower(),
+        "classification_reason": str(classification_reason or "").strip(),
+        "classification_authority_ref": str(
+            classification_authority_ref or ""
+        ).strip(),
+    }
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise ValueError(
+            "card budget activation requires non-empty " + ", ".join(missing)
+        )
+    if values["proposed_class"] not in {
+        *CARD_BUDGET_CLASS_LIMITS,
+        "large",
+    }:
+        raise ValueError(
+            "proposed_class must be one of tiny, small, medium, or large"
+        )
+    soft_limit, hard_limit, normalized_plan = _card_budget_limits(
+        values["initial_class"], plan_card_budget
+    )
+    predecessor = str(predecessor_run_id or "").strip() or None
+    successor_authority = str(successor_authority_ref or "").strip() or None
+    if predecessor and not successor_authority:
+        raise ValueError(
+            "successor runs require a non-empty successor_authority_ref"
+        )
+    if successor_authority and not predecessor:
+        raise ValueError(
+            "successor_authority_ref is only valid with predecessor_run_id"
+        )
+
+    now = int(time.time())
+    with write_txn(conn):
+        existing = _budget_run_row(conn, values["run_id"])
+        if existing is not None:
+            expected = {
+                "card_count_policy_version": CARD_COUNT_POLICY_VERSION,
+                "classifier_version": values["classifier_version"],
+                "classifier_evidence_digest": values["classifier_evidence_digest"],
+                "proposed_class": values["proposed_class"],
+                "initial_class": values["initial_class"],
+                "current_class": values["initial_class"],
+                "classification_reason": values["classification_reason"],
+                "classification_authority_ref": values["classification_authority_ref"],
+                "plan_card_budget": normalized_plan,
+                "soft_card_limit": soft_limit,
+                "hard_card_limit": hard_limit,
+                "predecessor_run_id": predecessor,
+            }
+            # A run's successor authority is a later relationship fact and
+            # may be populated after this activation is superseded. For a run
+            # that is itself a successor, however, the authority is part of
+            # its immutable activation and must match exact replays.
+            if predecessor is not None:
+                expected["successor_authority_ref"] = successor_authority
+            conflicts = [
+                name for name, expected_value in expected.items()
+                if existing[name] != expected_value
+            ]
+            if conflicts:
+                raise ValueError(
+                    f"conflicting activation replay for {values['run_id']}: "
+                    + ", ".join(conflicts)
+                )
+        else:
+            if predecessor:
+                predecessor_row = _budget_run_row(conn, predecessor)
+                if predecessor_row is None:
+                    raise ValueError(
+                        f"unknown predecessor card budget run {predecessor!r}"
+                    )
+                if predecessor_row["state"] != "wedged":
+                    raise ValueError(
+                        "a successor may only replace a durably wedged run"
+                    )
+                if predecessor_row["successor_run_id"] is not None:
+                    raise ValueError(
+                        f"predecessor {predecessor!r} already has successor "
+                        f"{predecessor_row['successor_run_id']!r}"
+                    )
+
+            root_task_id = _new_task_id()
+            while conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (root_task_id,)
+            ).fetchone():
+                root_task_id = _new_task_id()
+            conn.execute(
+                """
+                INSERT INTO card_budget_runs (
+                    id, card_count_policy_version, classifier_version,
+                    classifier_evidence_digest, proposed_class, initial_class,
+                    current_class, classification_reason,
+                    classification_authority_ref, plan_card_budget,
+                    soft_card_limit, hard_card_limit, state, root_task_id,
+                    predecessor_run_id, successor_authority_ref, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    values["run_id"], CARD_COUNT_POLICY_VERSION,
+                    values["classifier_version"],
+                    values["classifier_evidence_digest"],
+                    values["proposed_class"], values["initial_class"],
+                    values["initial_class"], values["classification_reason"],
+                    values["classification_authority_ref"], normalized_plan,
+                    soft_limit, hard_limit, root_task_id, predecessor,
+                    successor_authority, now,
+                ),
+            )
+            root_key = f"card-budget-root:{values['run_id']}"
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, title, body, status, priority, created_by, created_at,
+                    completed_at, workspace_kind, result, idempotency_key,
+                    budget_run_id
+                ) VALUES (?, ?, ?, 'done', 0, ?, ?, ?, 'scratch', ?, ?, ?)
+                """,
+                (
+                    root_task_id,
+                    f"Card budget tracking root: {values['run_id']}",
+                    "Non-dispatchable terminal root for card-count/v1 topology.",
+                    values["classification_authority_ref"], now, now,
+                    "budget root activated", root_key, values["run_id"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO card_budget_admissions (
+                    run_id, task_id, idempotency_key, admission_kind, admitted_at
+                ) VALUES (?, ?, ?, 'tracking_root', ?)
+                """,
+                (values["run_id"], root_task_id, root_key, now),
+            )
+            _append_event(
+                conn,
+                root_task_id,
+                "created",
+                {
+                    "status": "done",
+                    "budget_run_id": values["run_id"],
+                    "admission_kind": "tracking_root",
+                },
+            )
+            _append_budget_event(
+                conn,
+                values["run_id"],
+                event_key="activation",
+                kind="activated",
+                payload={
+                    "root_task_id": root_task_id,
+                    "soft_card_limit": soft_limit,
+                    "hard_card_limit": hard_limit,
+                    "predecessor_run_id": predecessor,
+                    "classification_authority_ref": values[
+                        "classification_authority_ref"
+                    ],
+                },
+                created_at=now,
+            )
+            if predecessor:
+                conn.execute(
+                    "UPDATE card_budget_runs "
+                    "SET state = 'superseded', successor_run_id = ?, "
+                    "    successor_authority_ref = ?, superseded_at = ? "
+                    "WHERE id = ? AND state = 'wedged' "
+                    "  AND successor_run_id IS NULL",
+                    (
+                        values["run_id"], successor_authority, now,
+                        predecessor,
+                    ),
+                )
+                _append_budget_event(
+                    conn,
+                    predecessor,
+                    event_key=f"successor:{values['run_id']}",
+                    kind="superseded",
+                    payload={
+                        "successor_run_id": values["run_id"],
+                        "successor_authority_ref": successor_authority,
+                    },
+                    created_at=now,
+                )
+    return get_card_budget_status(conn, values["run_id"])
+
+
+def _create_budgeted_task(
+    conn: sqlite3.Connection,
+    *,
+    budget_run_id: str,
+    title: str,
+    body: Optional[str],
+    assignee: Optional[str],
+    created_by: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+    project_id: Optional[str],
+    project_obj: Any,
+    project_repo: Optional[str],
+    tenant: Optional[str],
+    priority: int,
+    parents: tuple[str, ...],
+    triage: bool,
+    idempotency_key: str,
+    max_runtime_seconds: Optional[int],
+    skills_list: Optional[list[str]],
+    max_retries: Optional[int],
+    goal_mode: bool,
+    goal_max_turns: Optional[int],
+    initial_status: str,
+    session_id: Optional[str],
+) -> str:
+    """Create and admit one budgeted task in a single write transaction."""
+    now = int(time.time())
+    denial: Optional[BudgetAdmissionDenied] = None
+    result_task_id: Optional[str] = None
+    with write_txn(conn):
+        # Budgeted idempotency is stricter than the legacy best-effort path:
+        # the key is globally bound to one durable card/run, including after
+        # archive, and its admission fact must agree with the task row.
+        existing_rows = conn.execute(
+            "SELECT id, budget_run_id FROM tasks "
+            "WHERE idempotency_key = ? ORDER BY created_at DESC, id DESC",
+            (idempotency_key,),
+        ).fetchall()
+        if existing_rows:
+            existing = existing_rows[0]
+            if any(
+                row["budget_run_id"] != budget_run_id for row in existing_rows
+            ):
+                raise ValueError(
+                    f"idempotency key {idempotency_key!r} is already bound "
+                    "outside this budget run"
+                )
+            admission = conn.execute(
+                "SELECT idempotency_key FROM card_budget_admissions "
+                "WHERE run_id = ? AND task_id = ?",
+                (budget_run_id, existing["id"]),
+            ).fetchone()
+            if admission is None or admission["idempotency_key"] != idempotency_key:
+                raise ValueError(
+                    f"task {existing['id']} has an inconsistent budget admission"
+                )
+            result_task_id = existing["id"]
+        else:
+            task_id = _new_task_id()
+            while conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone():
+                task_id = _new_task_id()
+            allowed, projection, reason = _budget_preflight(
+                conn,
+                budget_run_id,
+                delta=1,
+                trigger_kind="create",
+                trigger_id=task_id,
+                trigger_metadata={"idempotency_key": idempotency_key},
+            )
+            if not allowed:
+                denial = BudgetAdmissionDenied(
+                    budget_run_id,
+                    reason or "budget admission denied",
+                    projection=projection,
+                    trigger={
+                        "kind": "create",
+                        "id": task_id,
+                        "idempotency_key": idempotency_key,
+                    },
+                )
+            else:
+                if initial_status == "blocked":
+                    task_status = "blocked"
+                elif triage:
+                    task_status = "triage"
+                else:
+                    task_status = "ready"
+                if parents:
+                    missing = _find_missing_parents(conn, parents)
+                    if missing:
+                        raise ValueError(
+                            f"unknown parent task(s): {', '.join(missing)}"
+                        )
+                    if task_status == "ready":
+                        placeholders = ",".join("?" * len(parents))
+                        rows = conn.execute(
+                            "SELECT status FROM tasks WHERE id IN "
+                            f"({placeholders})",
+                            parents,
+                        ).fetchall()
+                        if any(row["status"] != "done" for row in rows):
+                            task_status = "todo"
+
+                task_workspace_path = workspace_path
+                task_branch_name = branch_name
+                if project_obj is not None and workspace_kind == "worktree":
+                    if project_repo and not task_workspace_path:
+                        task_workspace_path = os.path.join(
+                            project_repo, ".worktrees", task_id
+                        )
+                    if not task_branch_name:
+                        try:
+                            from hermes_cli import projects_db as _pdb
+                            task_branch_name = _pdb.branch_name_for(
+                                project_obj, task_id, title=title
+                            )
+                        except Exception:
+                            task_branch_name = None
+
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, body, assignee, status, priority,
+                        created_by, created_at, workspace_kind, workspace_path,
+                        branch_name, project_id, tenant, idempotency_key,
+                        max_runtime_seconds, skills, max_retries, goal_mode,
+                        goal_max_turns, session_id, budget_run_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        task_id, title.strip(), body, assignee, task_status,
+                        priority, created_by, now, workspace_kind,
+                        task_workspace_path, task_branch_name, project_id,
+                        tenant, idempotency_key,
+                        int(max_runtime_seconds)
+                        if max_runtime_seconds is not None else None,
+                        json.dumps(skills_list)
+                        if skills_list is not None else None,
+                        int(max_retries) if max_retries is not None else None,
+                        1 if goal_mode else 0,
+                        int(goal_max_turns)
+                        if goal_max_turns is not None else None,
+                        session_id, budget_run_id,
+                    ),
+                )
+                for parent_id in parents:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                        "VALUES (?, ?)",
+                        (parent_id, task_id),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO card_budget_admissions (
+                        run_id, task_id, idempotency_key, admission_kind,
+                        admitted_at
+                    ) VALUES (?, ?, ?, 'task', ?)
+                    """,
+                    (budget_run_id, task_id, idempotency_key, now),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "created",
+                    {
+                        "assignee": assignee,
+                        "status": task_status,
+                        "parents": list(parents),
+                        "tenant": tenant,
+                        "branch_name": task_branch_name,
+                        "skills": list(skills_list) if skills_list else None,
+                        "goal_mode": bool(goal_mode) or None,
+                        "budget_run_id": budget_run_id,
+                    },
+                )
+                result_task_id = task_id
+    if denial is not None:
+        raise denial
+    if result_task_id is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("budgeted task admission produced no result")
+    return result_task_id
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2407,6 +3206,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    budget_run_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2430,6 +3230,11 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``budget_run_id`` opts the task into card-count/v1. Budgeted creates
+    require an idempotency key and commit admission/soft/hard evidence in the
+    same transaction as the task row. Children of budgeted parents must carry
+    the same explicit run id; they cannot silently fall back to unmetered work.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -2447,6 +3252,7 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    budget_run_id = str(budget_run_id or "").strip() or None
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2490,6 +3296,29 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+
+    parent_budget_runs: set[str] = set()
+    if parents:
+        placeholders = ",".join("?" * len(parents))
+        parent_budget_runs = {
+            str(row["budget_run_id"])
+            for row in conn.execute(
+                "SELECT DISTINCT budget_run_id FROM tasks "
+                f"WHERE id IN ({placeholders}) AND budget_run_id IS NOT NULL",
+                parents,
+            ).fetchall()
+        }
+    if parent_budget_runs:
+        if budget_run_id is None:
+            raise ValueError(
+                "budget_run_id is required for children of budgeted tasks"
+            )
+        if parent_budget_runs != {budget_run_id}:
+            raise ValueError(
+                "child budget_run_id must match every budgeted parent"
+            )
+    if budget_run_id is not None and not idempotency_key:
+        raise ValueError("budgeted tasks require an idempotency_key")
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2541,7 +3370,7 @@ def create_task(
     # and to avoid holding a write lock during the lookup. Race is
     # acceptable: two concurrent creators with the same key might both
     # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
+    if idempotency_key and budget_run_id is None:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
@@ -2572,6 +3401,34 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    if budget_run_id is not None:
+        return _create_budgeted_task(
+            conn,
+            budget_run_id=budget_run_id,
+            title=title,
+            body=body,
+            assignee=assignee,
+            created_by=created_by,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            project_id=project_id,
+            project_obj=project_obj,
+            project_repo=project_repo,
+            tenant=tenant,
+            priority=priority,
+            parents=parents,
+            triage=triage,
+            idempotency_key=str(idempotency_key),
+            max_runtime_seconds=max_runtime_seconds,
+            skills_list=skills_list,
+            max_retries=max_retries,
+            goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns,
+            initial_status=initial_status,
+            session_id=session_id,
+        )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -3410,6 +4267,32 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "       budget_run_id "
+            "FROM tasks WHERE id = ? AND status = 'ready' "
+            "  AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if trow is None:
+            return None
+        if trow["budget_run_id"]:
+            prior_attempts = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()["n"]
+            )
+            allowed, _, _ = _budget_preflight(
+                conn,
+                trow["budget_run_id"],
+                delta=1 if prior_attempts else 0,
+                trigger_kind="claim",
+                trigger_id=task_id,
+                attempt=prior_attempts + 1,
+            )
+            if not allowed:
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -3445,13 +4328,6 @@ def claim_task(
         )
         if cur.rowcount != 1:
             return None
-        # Look up the current task row so we can populate the run with
-        # its assignee / step / runtime cap.
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
@@ -3514,6 +4390,32 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "       budget_run_id "
+            "FROM tasks WHERE id = ? AND status = 'review' "
+            "  AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if trow is None:
+            return None
+        if trow["budget_run_id"]:
+            prior_attempts = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM task_runs WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()["n"]
+            )
+            allowed, _, _ = _budget_preflight(
+                conn,
+                trow["budget_run_id"],
+                delta=1 if prior_attempts else 0,
+                trigger_kind="review_claim",
+                trigger_id=task_id,
+                attempt=prior_attempts + 1,
+            )
+            if not allowed:
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3529,11 +4431,6 @@ def claim_review_task(
         )
         if cur.rowcount != 1:
             return None
-        trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
@@ -5239,10 +6136,15 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, budget_run_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row or row["status"] != "archived":
+            return False
+        # card-count/v1 admissions are cumulative and never refundable.
+        # Preserve the durable task row and its attempt ledger even after the
+        # card is archived; status hides it from ordinary listings.
+        if row["budget_run_id"]:
             return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
@@ -5267,6 +6169,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT budget_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["budget_run_id"]:
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
