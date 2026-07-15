@@ -2858,8 +2858,13 @@ def activate_card_budget(
                 "soft_card_limit": soft_limit,
                 "hard_card_limit": hard_limit,
                 "predecessor_run_id": predecessor,
-                "successor_authority_ref": successor_authority,
             }
+            # A run's successor authority is a later relationship fact and
+            # may be populated after this activation is superseded. For a run
+            # that is itself a successor, however, the authority is part of
+            # its immutable activation and must match exact replays.
+            if predecessor is not None:
+                expected["successor_authority_ref"] = successor_authority
             conflicts = [
                 name for name, expected_value in expected.items()
                 if existing[name] != expected_value

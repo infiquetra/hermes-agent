@@ -232,6 +232,10 @@ def test_successor_links_only_after_wedged_predecessor(conn):
     )
     assert predecessor["consumed_card_count"] == 10
 
+    replay = kb.activate_card_budget(conn, **_activation())
+    assert replay["state"] == "superseded"
+    assert replay["successor_run_id"] == "run-2"
+
 
 def test_status_survives_connection_restart(tmp_path):
     path = tmp_path / "restart.db"
